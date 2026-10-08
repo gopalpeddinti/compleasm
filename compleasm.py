@@ -8,10 +8,12 @@ Date: 2023 Apr 11
 
 import os
 import argparse
+import fcntl
 import hashlib
 import sys
 import tarfile
 import urllib.request
+from urllib.error import URLError
 import subprocess
 from multiprocessing import Pool
 import shlex
@@ -45,16 +47,6 @@ def warn_deprecated_min_complete(value):
 
 
 ### DownloadLineage.py
-
-class URLError(OSError):
-    def __init__(self, reason, filename=None):
-        self.args = reason,
-        self.reason = reason
-        if filename is not None:
-            self.filename = filename
-
-    def __str__(self):
-        return '<urlopen error %s>' % self.reason
 
 
 def md5(fname):
@@ -157,75 +149,113 @@ class Downloader:
                     placement_description_dict[strain] = [date, hash_value, category]
         return lineages_description_dict, placement_description_dict
 
+    @staticmethod
+    def _is_valid_lineage(lineage_dir):
+        if not os.path.isdir(lineage_dir):
+            return False
+
+        refseq_paths = [
+            os.path.join(lineage_dir, "refseq_db.faa.gz"),
+            os.path.join(lineage_dir, "refseq_db.faa"),
+        ]
+        if not any(os.path.isfile(path) and os.path.getsize(path) > 0 for path in refseq_paths):
+            return False
+
+        scores_cutoff = os.path.join(lineage_dir, "scores_cutoff")
+        hmm_dir = os.path.join(lineage_dir, "hmms")
+        return (
+            os.path.isfile(scores_cutoff)
+            and os.path.getsize(scores_cutoff) > 0
+            and os.path.isdir(hmm_dir)
+            and any(
+                name.endswith(".hmm")
+                and os.path.isfile(os.path.join(hmm_dir, name))
+                and os.path.getsize(os.path.join(hmm_dir, name)) > 0
+                for name in os.listdir(hmm_dir)
+            )
+        )
+
+    def _register_lineage_path(self, lineage, lineage_dir):
+        if lineage not in self.lineage_description:
+            self.lineage_description[lineage] = [lineage, "Unknown", "Unknown"]
+        description = self.lineage_description[lineage]
+        if len(description) > 3:
+            description[3] = lineage_dir
+        else:
+            description.append(lineage_dir)
+
     def download_lineage(self, lineage, odb):
         lineage = "{}_{}".format(lineage.strip().split("_")[0], odb)
-        if os.path.exists(os.path.join(self.download_dir, lineage) + ".tmp"):
-            sys.exit("{}.tmp exists, another process is downloading, please run again later.".format(lineage))
+        lineage_dir = os.path.join(self.download_dir, lineage)
+        done_path = lineage_dir + ".done"
+        tmp_path = lineage_dir + ".tmp"
+        lock_path = lineage_dir + ".lock"
 
-        if not os.path.exists(os.path.join(self.download_dir, lineage) + ".done"):
-            open(os.path.join(self.download_dir, lineage) + ".tmp", 'w').close()
-
+        with open(lock_path, "a") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            download_path = None
+            downloaded = False
             try:
-                date, expected_hash = self.lineage_description[lineage][0:2]  # [date, hash_value, category]
-            except KeyError:
-                os.remove(os.path.join(self.download_dir, lineage) + ".tmp")
-                raise Error("invalid lineage name: {}".format(lineage))
+                if self._is_valid_lineage(lineage_dir):
+                    self._register_lineage_path(lineage, lineage_dir)
+                    if not os.path.exists(done_path):
+                        open(done_path, "w").close()
+                    return
 
-            remote_url = self.base_url + "lineages/{}.{}.tar.gz".format(lineage, date)
-            download_path = os.path.join(self.download_dir, "{}.{}.tar.gz".format(lineage, date))
-            download_success = self.download_single_file(remote_url, download_path, expected_hash)
-
-            if not download_success:
-                os.remove(os.path.join(self.download_dir, lineage) + ".tmp")
-                raise Error("Unable to download necessary file {}".format("{}.{}.tar.gz".format(lineage, date)))
-
-            if download_success:
-                tar = tarfile.open(download_path)
                 try:
-                    tar_members = tar.getmembers()
-                    tar_names = {member.name for member in tar_members}
-                    if f"{lineage}/refseq_db.faa.gz" in tar_names:
-                        refseq_member = f"{lineage}/refseq_db.faa.gz"
-                    elif f"{lineage}/refseq_db.faa" in tar_names:
-                        refseq_member = f"{lineage}/refseq_db.faa"
-                    else:
-                        raise ValueError("`refseq_db.faa.gz` or `refseq_db.faa` not found in lineage!")
+                    date, expected_hash = self.lineage_description[lineage][0:2]
+                except KeyError:
+                    raise Error("invalid lineage name: {}".format(lineage))
 
-                    required_members = [
-                        refseq_member,
-                        f"{lineage}/hmms",
-                        f"{lineage}/scores_cutoff",
-                    ]
-                    lengths_cutoff_member = f"{lineage}/lengths_cutoff"
-                    if lengths_cutoff_member in tar_names:
-                        required_members.append(lengths_cutoff_member)
-                    dataset_cfg_member = f"{lineage}/dataset.cfg"
-                    if dataset_cfg_member in tar_names:
-                        required_members.append(dataset_cfg_member)
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if os.path.exists(done_path):
+                    os.remove(done_path)
+                open(tmp_path, "w").close()
 
-                    tar.extractall(
-                        self.download_dir,
-                        members=[tar.getmember(u) for u in required_members],
-                    )
-                    hmm_members = [member for member in tar_members if ".hmm" in member.name]
-                    tar.extractall(self.download_dir, members=hmm_members)
-                except:
-                    os.remove(os.path.join(self.download_dir, lineage) + ".tmp")
-                    os.remove(download_path)
-                    raise Error("Unable to extract files from {}".format("{}.{}.tar.gz".format(lineage, date)))
+                archive_name = "{}.{}.tar.gz".format(lineage, date)
+                remote_url = self.base_url + "lineages/" + archive_name
+                download_path = os.path.join(self.download_dir, archive_name)
+                if not self.download_single_file(remote_url, download_path, expected_hash):
+                    raise Error("Unable to download necessary file {}".format(archive_name))
 
-                tar.close()
+                try:
+                    with tarfile.open(download_path) as tar:
+                        tar_members = tar.getmembers()
+                        tar_names = {member.name for member in tar_members}
+                        if f"{lineage}/refseq_db.faa.gz" in tar_names:
+                            refseq_member = f"{lineage}/refseq_db.faa.gz"
+                        elif f"{lineage}/refseq_db.faa" in tar_names:
+                            refseq_member = f"{lineage}/refseq_db.faa"
+                        else:
+                            raise ValueError("`refseq_db.faa.gz` or `refseq_db.faa` not found in lineage!")
+
+                        required_members = [
+                            refseq_member,
+                            f"{lineage}/hmms",
+                            f"{lineage}/scores_cutoff",
+                        ]
+                        for optional_member in (f"{lineage}/lengths_cutoff", f"{lineage}/dataset.cfg"):
+                            if optional_member in tar_names:
+                                required_members.append(optional_member)
+                        tar.extractall(self.download_dir, members=[tar.getmember(name) for name in required_members])
+                        hmm_members = [member for member in tar_members if ".hmm" in member.name]
+                        tar.extractall(self.download_dir, members=hmm_members)
+                except Exception as error:
+                    raise Error("Unable to extract files from {}".format(archive_name)) from error
+
+                if not self._is_valid_lineage(lineage_dir):
+                    raise Error("Downloaded lineage is incomplete: {}".format(lineage))
+
+                open(done_path, "w").close()
+                self._register_lineage_path(lineage, lineage_dir)
+                downloaded = True
                 print("Lineage file extraction path: {}/{}".format(self.download_dir, lineage))
-                local_lineage_dir = os.path.join(self.download_dir, lineage)
-                self.lineage_description[lineage].append(local_lineage_dir)
-                open(os.path.join(self.download_dir, lineage) + ".done", 'w').close()
-                os.remove(os.path.join(self.download_dir, lineage) + ".tmp")
-        else:
-            if lineage not in self.lineage_description.keys():
-                ## for modified lineage file by user
-                self.lineage_description[lineage] = [lineage, "Unknown", "Unknown", os.path.join(self.download_dir, lineage)]
-            else:
-                self.lineage_description[lineage].append(os.path.join(self.download_dir, lineage))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if not downloaded and download_path and os.path.exists(download_path):
+                    os.remove(download_path)
 
     def download_placement(self):
         if os.path.exists(self.placement_dir + ".tmp"):
@@ -321,7 +351,9 @@ class AutoLineager:
         self.sepp_output_folder = sepp_output_directory
         self.sepp_tmp_folder = sepp_tmp_directory
         self.threads = threads
-        self.downloader = Downloader(odb=odb, download_dir=library_path, autolineage=True)
+        self.downloader = Downloader(
+            odb=odb, download_dir=library_path, download_lineage=True, autolineage=True
+        )
         self.lineage_description = self.downloader.lineage_description
         self.placement_description = self.downloader.placement_description
         self.library_folder = self.downloader.download_dir
@@ -1738,7 +1770,7 @@ class CompleasmRunner:
         self.hmmsearch_execute_command = hmmsearch_execute_command
 
         self.miniprot_runner = MiniprotRunner(miniprot_execute_command, outs, nthreads)
-        self.downloader = Downloader(odb=odb, download_dir=library_path)
+        self.downloader = Downloader(odb=odb, download_dir=library_path, download_lineage=autolineage)
 
         self.hmm_profiles = os.path.join(self.downloader.download_dir, self.lineage, "hmms")
 
@@ -1879,7 +1911,7 @@ class ProteinRunner():
         self.odb = odb
         self.nthreads = nthreads
         self.hmmsearch_execute_command = hmmsearch_execute_command
-        self.downloader = Downloader(odb=odb, download_dir=library_path)
+        self.downloader = Downloader(odb=odb, download_dir=library_path, download_lineage=False)
         if not os.path.exists(self.output_folder):
             os.mkdir(self.output_folder)
         self.hmmsearch_output_folder = os.path.join(self.output_folder, "{}_hmmsearch_output".format(self.lineage))
@@ -2176,7 +2208,7 @@ class CheckDependency():
 
 
 def download(args):
-    downloader = Downloader(odb=args.odb, download_dir=args.library_path)
+    downloader = Downloader(odb=args.odb, download_dir=args.library_path, download_lineage=False)
     lineages = []
     for v in args.lineages:
         lineages.extend(v.strip().split(','))
