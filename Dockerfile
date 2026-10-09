@@ -30,6 +30,6 @@ RUN pip3 install --break-system-packages git+https://github.com/smirarab/sepp.gi
 
 # Install compleasm from GitHub
 RUN pip3 install --break-system-packages \
-    git+https://github.com/huangnengCSU/compleasm.git
+    git+https://github.com/gopalpeddinti/compleasm.git
 
 CMD ["compleasm"]
